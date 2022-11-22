@@ -171,9 +171,9 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
         logger.info(f"Genome {genome_id} in {file_path} already exist. Skip...")
         return
     elif complement_compression_file_path.exists():
-        logger.info(f"File {complement_compression_file_path} exists. Use this file instead of downloading")
         # (Un-)Compressed file already exists, so we don't need to download the genome and just (de-)compress the file
         async with asyncio_semaphore:
+            logger.info(f"File {complement_compression_file_path} exists. Use this file instead of downloading")
             if complement_compression_file_path.name.endswith("gz"):
                 # file is compressed
                 async with aiofiles.open(complement_compression_file_path, mode='rb') as fin, aiofiles.open(file_path, mode='wb') as fout:
