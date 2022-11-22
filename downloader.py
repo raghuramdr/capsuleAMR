@@ -161,7 +161,7 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
         Config with additional information
     """
     file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
-                                      f"{genome_id}.fa{'.gz' if config.compress else ''}")
+                                      f"{genome_id}.fa{'.bz2' if config.compress else ''}")
     complement_compression_file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
                                                              f"{genome_id}.fa{'' if config.compress else '.bz2'}")
     # if the file exist we don't download it unless we force it
@@ -174,7 +174,7 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
         # (Un-)Compressed file already exists, so we don't need to download the genome and just (de-)compress the file
         async with asyncio_semaphore:
             logger.info(f"File {complement_compression_file_path} exists. Use this file instead of downloading")
-            if complement_compression_file_path.name.endswith("gz"):
+            if complement_compression_file_path.name.endswith("bz2"):
                 # file is compressed
                 async with aiofiles.open(complement_compression_file_path, mode='rb') as fin, aiofiles.open(file_path, mode='wb') as fout:
                     bgzf_reader = AsyncBgzfReader(fin)
@@ -277,11 +277,11 @@ def create_symlinks(genome_list: List[GenomeInformation], genomes_path: Path, lo
         Config with additional information
     """
     for genome_info in genome_list:
-        file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
+        file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa{'.bz2' if config.compress else ''}")
         if file_path.exists():
             logger.info(f"Genome {genome_info.genome_id} in {file_path} already exist. Skip...")
             continue
-        link_file = genomes_path.joinpath(GENOME_FOLDER_NAME, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
+        link_file = genomes_path.joinpath(GENOME_FOLDER_NAME, f"{genome_info.genome_id}.fa{'.bz2' if config.compress else ''}")
         file_path.symlink_to(link_file.absolute())
         logger.info(f"{file_path.name} already downloaded. Link to {link_file}")
 
