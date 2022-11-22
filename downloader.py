@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import dataclasses
+from io import BytesIO
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ import pandas as pd
 from httpx import AsyncClient
 
 from colored_logger import LoggerContextManager
+from async_bgzf import AsyncBgzfWriter
 
 OLD_GID_COLUMN_NAME = "Genome ID"
 OLD_ANTIBIOTIC_COLUMN_NAME = "Antibiotic"
@@ -57,6 +59,7 @@ def read_file(csv_path: Path) -> pd.DataFrame:
     df.rename(columns={OLD_GID_COLUMN_NAME: GID_COLUMN_NAME, OLD_ANTIBIOTIC_COLUMN_NAME: ANTIBIOTIC_COLUMN_NAME},
               inplace=True)
     df[ANTIBIOTIC_COLUMN_NAME] = df[ANTIBIOTIC_COLUMN_NAME].str.replace("/", "_")
+    df[ANTIBIOTIC_COLUMN_NAME] = df[ANTIBIOTIC_COLUMN_NAME].str.replace(" ", "-")
     return df
 
 
@@ -99,6 +102,8 @@ def set_parameters() -> argparse.Namespace:
                         help="Time in seconds to sleep before downloading a genome. Default 3.")
     parser.add_argument("--max-retry", type=int, required=False, default=5, dest="max_retry",
                         help="Number of times the script retries to download a genome after an error. Default 5.")
+    parser.add_argument("--no-compress", action="store_false", dest="compress",
+                        help="Force to save raw file instead of compressing it")
     args = parser.parse_args()
     return args
 
@@ -163,7 +168,7 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
     config : argparse.Namespace
         Config with additional information
     """
-    file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa")
+    file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
     # if the file exist we don't download it unless we force it
     if file_path.exists() and not config.redownload:
         logger.info(f"Genome {genome_info.genome_id} in {file_path} already exist. Skip...")
@@ -186,8 +191,14 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
                                          url="https://patricbrc.org/api/genome_sequence/?&http_download=true&http_accept=application/dna+fasta",
                                          data=data) as resp:
                     async with aiofiles.open(file_path, mode='wb') as f:
+                        async_bgzf_writer = AsyncBgzfWriter(async_fileobj=f)
                         async for chunk in resp.aiter_bytes():
-                            await f.write(chunk)
+                            if config.compress:
+                                await async_bgzf_writer.write(data=chunk)
+                            else:
+                                await f.write(chunk)
+                        if config.compress:
+                            await async_bgzf_writer.close()
                 logger.info(f"FASTA file for genome ID {genome_info.genome_id} successfully written to {file_path}")
                 break
         except (httpx.ReadTimeout, httpx.ConnectTimeout) as _:
@@ -218,7 +229,7 @@ async def download_genomes(genome_list: List[GenomeInformation], genomes_path: P
     }
     # Limit the TCP Connections
     tcp_limits = httpx.Limits(max_connections=config.max_connections, max_keepalive_connections=20)
-    client = AsyncClient(headers=headers, limits=tcp_limits)
+    client = AsyncClient(headers=headers, limits=tcp_limits, timeout=10)
     # Limit the number of Coroutine that a running at the same time to the number of TCP Connection to avoid a Timeout
     asyncio_semaphore = asyncio.BoundedSemaphore(config.max_connections)
     tasks = []
