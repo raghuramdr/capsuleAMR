@@ -1,10 +1,9 @@
 import argparse
 import asyncio
 import dataclasses
-from io import BytesIO
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import aiofiles
 import httpx
@@ -12,19 +11,20 @@ import pandas as pd
 from httpx import AsyncClient
 
 from colored_logger import LoggerContextManager
-from async_bgzf import AsyncBgzfWriter
+from async_bgzf import AsyncBgzfWriter, AsyncBgzfReader
 
 OLD_GID_COLUMN_NAME = "Genome ID"
 OLD_ANTIBIOTIC_COLUMN_NAME = "Antibiotic"
 GID_COLUMN_NAME = "genome_id"
 ANTIBIOTIC_COLUMN_NAME = "antibiotic"
 
+GENOME_FOLDER_NAME = "genomes"
+
 
 @dataclasses.dataclass
 class GenomeInformation:
     genome_id: str
     antibiotic: str
-    links_to: Optional["GenomeInformation"] = None
 
 
 def read_file(csv_path: Path) -> pd.DataFrame:
@@ -108,7 +108,7 @@ def set_parameters() -> argparse.Namespace:
     return args
 
 
-def preprocess_genome_ids(df: pd.DataFrame) -> Tuple[List[GenomeInformation], List[GenomeInformation]]:
+def preprocess_genome_ids(df: pd.DataFrame) -> Tuple[List[str], List[GenomeInformation]]:
     """
     Select the files which should be downloaded and which symlinks to create
 
@@ -124,8 +124,7 @@ def preprocess_genome_ids(df: pd.DataFrame) -> Tuple[List[GenomeInformation], Li
     genome_symlink_info_list : list[GenomeInformation]
         All combinations of genome_id and antibiotic for which the genome can be linked
     """
-    download_files: Dict[str, GenomeInformation] = dict()
-    genome_download_info_list: List[GenomeInformation] = []
+    genome_download_ids = list(df[GID_COLUMN_NAME].unique())
     genome_symlink_info_list: List[GenomeInformation] = []
     genome_antibiotic_combination_set = set()
     for _, row in df.iterrows():
@@ -135,20 +134,13 @@ def preprocess_genome_ids(df: pd.DataFrame) -> Tuple[List[GenomeInformation], Li
             continue
         genome_antibiotic_combination_set.add(genome_antibiotic_hash)
 
-        genome_id = row[GID_COLUMN_NAME]
-        next_genome_info = GenomeInformation(genome_id=genome_id, antibiotic=row[ANTIBIOTIC_COLUMN_NAME])
         # If we already encountered the genome_id, reference it
-        if genome_id in download_files:
-            next_genome_info.links_to = download_files[genome_id]
-            genome_symlink_info_list.append(next_genome_info)
-        else:
-            download_files[genome_id] = next_genome_info
-            genome_download_info_list.append(next_genome_info)
-    return genome_download_info_list, genome_symlink_info_list
+        genome_symlink_info_list.append(GenomeInformation(genome_id=row[GID_COLUMN_NAME], antibiotic=row[ANTIBIOTIC_COLUMN_NAME]))
+    return list(genome_download_ids), genome_symlink_info_list
 
 
 async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: AsyncClient,
-                        genome_info: GenomeInformation, genomes_path: Path, logger: logging.Logger,
+                        genome_id: str, genomes_path: Path, logger: logging.Logger,
                         config: argparse.Namespace):
     """
     Download a genome
@@ -159,8 +151,8 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
         BoundedSemaphore to ensure that only a number of Coroutine a active at the same time
     client : httpx.AsyncClient
         Client to download the genome
-    genome_info : GenomeInformation
-        Information about the genome to download.
+    genome_id : str
+        ID of genome to download.
     genomes_path : pathlib.Path
         Directory path where to save the genome
     logger : logging.Logger
@@ -168,15 +160,43 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
     config : argparse.Namespace
         Config with additional information
     """
-    file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
+    file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
+                                      f"{genome_id}.fa{'.gz' if config.compress else ''}")
+    complement_compression_file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
+                                                             f"{genome_id}.fa{'' if config.compress else '.gz'}")
     # if the file exist we don't download it unless we force it
-    if file_path.exists() and not config.redownload:
-        logger.info(f"Genome {genome_info.genome_id} in {file_path} already exist. Skip...")
+    if config.redownload:
+        pass
+    elif file_path.exists():
+        logger.info(f"Genome {genome_id} in {file_path} already exist. Skip...")
         return
+    elif complement_compression_file_path.exists():
+        logger.info(f"File {complement_compression_file_path} exists. Use this file instead of downloading")
+        # (Un-)Compressed file already exists, so we don't need to download the genome and just (de-)compress the file
+        async with asyncio_semaphore:
+            if complement_compression_file_path.name.endswith("gz"):
+                # file is compressed
+                async with aiofiles.open(complement_compression_file_path, mode='rb') as fin, aiofiles.open(file_path, mode='wb') as fout:
+                    bgzf_reader = AsyncBgzfReader(fin)
+                    await bgzf_reader.start()
+                    async for line in bgzf_reader:
+                        await fout.write(line)
+                    await bgzf_reader.close()
+            else:
+                # file is uncompressed
+                async with aiofiles.open(complement_compression_file_path, mode='rb') as fin, aiofiles.open(file_path, mode='wb') as fout:
+                    bgzf_writer = AsyncBgzfWriter(fout)
+                    chunk = await fin.read(65536)
+                    while chunk:
+                        await bgzf_writer.write(chunk)
+                        chunk = await fin.read(65536)
+                    await bgzf_writer.close()
+        return
+
     # Download the genome
     retry_counter = 0
     data = {
-        "rql": f"in(genome_id%2C({genome_info.genome_id}))%26sort(%2Bsequence_id)%26limit(2500000)",
+        "rql": f"in(genome_id%2C({genome_id}))%26sort(%2Bsequence_id)%26limit(2500000)",
     }
     while retry_counter < config.max_retry:
         try:
@@ -184,39 +204,38 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
                 await asyncio.sleep(float(config.sleep_time))  # Sleep to avoid to many request at once
                 if retry_counter > 0:
                     logger.info(
-                        f"Retry download genome {genome_info.genome_id} to {file_path} {retry_counter + 1}/{config.max_retry}")
+                        f"Retry download genome {genome_id} to {file_path} {retry_counter + 1}/{config.max_retry}")
                 else:
-                    logger.info(f"Download genome {genome_info.genome_id} to {file_path}")
+                    logger.info(f"Download genome {genome_id} to {file_path}")
                 async with client.stream("POST",
                                          url="https://patricbrc.org/api/genome_sequence/?&http_download=true&http_accept=application/dna+fasta",
-                                         data=data) as resp:
-                    async with aiofiles.open(file_path, mode='wb') as f:
-                        async_bgzf_writer = AsyncBgzfWriter(async_fileobj=f)
-                        async for chunk in resp.aiter_bytes():
-                            if config.compress:
-                                await async_bgzf_writer.write(data=chunk)
-                            else:
-                                await f.write(chunk)
+                                         data=data) as resp, aiofiles.open(file_path, mode='wb') as f:
+                    async_bgzf_writer = AsyncBgzfWriter(async_fileobj=f)
+                    async for chunk in resp.aiter_bytes():
                         if config.compress:
-                            await async_bgzf_writer.close()
-                logger.info(f"FASTA file for genome ID {genome_info.genome_id} successfully written to {file_path}")
+                            await async_bgzf_writer.write(data=chunk)
+                        else:
+                            await f.write(chunk)
+                    if config.compress:
+                        await async_bgzf_writer.close()
+                logger.info(f"FASTA file for genome ID {genome_id} successfully written to {file_path}")
                 break
         except (httpx.ReadTimeout, httpx.ConnectTimeout) as _:
             retry_counter += 1
             logger.error(
-                f"Error when downloading genome {genome_info.genome_id}. {'Retry to download.' if retry_counter < config.max_retry else 'Skip this genome. Try again later.'}")
+                f"Error when downloading genome {genome_id}. {'Retry to download.' if retry_counter < config.max_retry else 'Skip this genome. Try again later.'}")
             file_path.unlink(missing_ok=True)
 
 
-async def download_genomes(genome_list: List[GenomeInformation], genomes_path: Path, logger: logging.Logger,
+async def download_genomes(genome_id_list: List[str], genomes_path: Path, logger: logging.Logger,
                            config: argparse.Namespace):
     """
     Wrapper function for managing the async download of the genomes.
 
     Parameters
     ----------
-    genome_list : list[GenomeInformation]
-        Information about all the  genomes to download.
+    genome_id_list : list[str]
+        IDs of all the  genomes to download.
     genomes_path : pathlib.Path
         Directory path where to save the genomes
     logger : logging.Logger
@@ -233,9 +252,9 @@ async def download_genomes(genome_list: List[GenomeInformation], genomes_path: P
     # Limit the number of Coroutine that a running at the same time to the number of TCP Connection to avoid a Timeout
     asyncio_semaphore = asyncio.BoundedSemaphore(config.max_connections)
     tasks = []
-    for genome_info in genome_list:
+    for genome_id in genome_id_list:
         tasks.append(
-            asyncio.ensure_future(download_file(asyncio_semaphore, client, genome_info, genomes_path, logger, config)))
+            asyncio.ensure_future(download_file(asyncio_semaphore, client, genome_id, genomes_path, logger, config)))
 
     logger.info("Start downloading genomes")
     await asyncio.gather(*tasks)
@@ -258,14 +277,13 @@ def create_symlinks(genome_list: List[GenomeInformation], genomes_path: Path, lo
         Config with additional information
     """
     for genome_info in genome_list:
-        file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa")
-        if file_path.exists() and not config.redownload:
+        file_path = genomes_path.joinpath(genome_info.antibiotic, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
+        if file_path.exists():
             logger.info(f"Genome {genome_info.genome_id} in {file_path} already exist. Skip...")
             continue
-        if genome_info.links_to is not None:
-            link_file = genomes_path.joinpath(genome_info.links_to.antibiotic, f"{genome_info.links_to.genome_id}.fa")
-            file_path.symlink_to(link_file.absolute())
-            logger.info(f"{file_path.name} already downloaded. Link to {link_file}")
+        link_file = genomes_path.joinpath(GENOME_FOLDER_NAME, f"{genome_info.genome_id}.fa{'.gz' if config.compress else ''}")
+        file_path.symlink_to(link_file.absolute())
+        logger.info(f"{file_path.name} already downloaded. Link to {link_file}")
 
 
 if __name__ == "__main__":
@@ -282,6 +300,7 @@ if __name__ == "__main__":
             antibiotic_path = data_path.joinpath(antibiotic)
             logger.info(f"Create folder {antibiotic_path}")
             antibiotic_path.mkdir(exist_ok=True)
+        data_path.joinpath(GENOME_FOLDER_NAME).mkdir(exist_ok=True)
 
         genomes_download, genomes_symlink = preprocess_genome_ids(df)
 
