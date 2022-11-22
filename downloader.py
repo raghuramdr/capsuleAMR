@@ -163,7 +163,7 @@ async def download_file(asyncio_semaphore: asyncio.BoundedSemaphore, client: Asy
     file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
                                       f"{genome_id}.fa{'.gz' if config.compress else ''}")
     complement_compression_file_path = genomes_path.joinpath(GENOME_FOLDER_NAME,
-                                                             f"{genome_id}.fa{'' if config.compress else '.gz'}")
+                                                             f"{genome_id}.fa{'' if config.compress else '.bz2'}")
     # if the file exist we don't download it unless we force it
     if config.redownload:
         pass
